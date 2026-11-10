@@ -2,42 +2,47 @@
 
 Terraform for running a containerised app on ECS Fargate behind an Application
 Load Balancer. Everything is created from scratch: VPC, subnets, NAT gateways,
-security groups, network ACLs, the ALB, the ECS cluster and service, the task
-execution role, and a CloudWatch log group.
+security groups, network ACLs, the load balancer, the ECS cluster and service,
+IAM roles, and a CloudWatch log group.
 
 By default it deploys `nginx:latest` on port 80 across three tasks in
-`us-west-2`, which is enough to prove the stack works end to end.
-
-## What gets created
-
-- VPC `172.17.0.0/16` with `az_count` public and `az_count` private subnets,
-  one per availability zone, carved out with `cidrsubnet`.
-- Internet gateway and a public route, plus a NAT gateway and Elastic IP per
-  AZ so private subnets can reach the internet.
-- One route table per private subnet, explicitly associated.
-- Network ACLs on both the public and private subnets, restricting traffic to
-  the app port, 443, and ephemeral ports.
-- Two security groups: one for the ALB (open on `app_port`), one for the ECS
-  tasks (inbound only from the ALB).
-- ALB in the public subnets, with an IP-type target group and an HTTP listener
-  on `app_port`.
-- ECS cluster, Fargate task definition rendered from
-  `templates/ecs/myapp.json.tpl`, and a service in the private subnets.
-- IAM task execution role with `AmazonECSTaskExecutionRolePolicy` attached.
-- CloudWatch log group `/ecs/myapp` retaining 30 days, with a log stream.
+`us-west-2`, behind plain HTTP, which is enough to prove the stack works end to
+end.
 
 ```
 Internet
    │
-   ├── IGW ── ALB (public subnets, :80)
-   │            │  target group (ip)
+   ├── IGW ── ALB (public subnets)  HTTP:80 → redirect if HTTPS is on
+   │            │  target group :app_port
    │            ▼
    │        ECS service ── Fargate tasks (private subnets)
+   │            │   ├── awslogs → /ecs/<prefix>
+   │            │   └── autoscaling on average CPU
    │            │
-   │            └── awslogs → /ecs/myapp
-   │
-   └── NAT gateways (one per AZ) ← private subnet egress
+   │            └── NAT gateways (one per AZ) → egress
 ```
+
+## Features
+
+- **Two modes of entry**: HTTP only, or HTTPS with an ACM certificate. Supplying
+  `certificate_arn` adds a 443 listener and turns the HTTP listener into a
+  redirect. No certificate, no redirect, no surprises.
+- **Separate execution and task roles.** The ECS agent gets a role for pulling
+  images, writing logs and reading secrets; the application gets its own role.
+  Set `create_iam_roles = false` to bring your own.
+- **Secrets from SSM or Secrets Manager.** Pass `secrets = { NAME = arn }` and
+  the execution role is granted read access to exactly those ARNs.
+- **Autoscaling** on average CPU, on by default. `desired_count` stops being a
+  diff source once the policy is attached, so Terraform will not fight the
+  scaler.
+- **Deployment circuit breaker** with automatic rollback when a deployment
+  fails to stabilise.
+- **ECS Exec**, off by default. Turn it on and the SSM channel permissions are
+  added to the task role.
+- **Container Insights** on the cluster, on by default.
+- **Read-only root filesystem** for the container, on by default.
+- **One NAT gateway per AZ**, each with its own route table, so a zone failure
+  does not break egress for the other zones.
 
 ## Usage
 
@@ -45,117 +50,188 @@ Internet
 git clone https://github.com/adityapidikiti/terraform_ecs.git
 cd terraform_ecs
 terraform init
-terraform plan
 terraform apply
 ```
 
-`provider.tf` reads the credentials from two variables, so Terraform prompts
-for them if they are not set:
+Credentials come from the standard AWS provider chain, which means environment
+variables, `~/.aws/config`, SSO, or an instance role. Nothing secret is declared
+in this repository.
 
 ```bash
-export TF_VAR_AWS_ACCESS_KEY=...
-export TF_VAR_AWS_SECRET_KEY=...
-export TF_VAR_aws_region=us-west-2
+aws sso login --profile dev
+export AWS_PROFILE=dev
+terraform apply
 ```
 
-Once applied, the ALB hostname is printed:
+Once applied:
 
 ```bash
+terraform output url
 terraform output alb_hostname
 ```
 
-Give the service a minute or two to register tasks with the target group before
-the hostname responds.
+Give the service a minute to register tasks with the target group before the
+hostname responds.
 
-Tear everything down with:
+Tear down with `terraform destroy`. The NAT gateways and load balancer are the
+line items that cost money while it runs.
 
-```bash
-terraform destroy
-```
+## Common changes
 
-## Deploying something other than nginx
-
-Point `app_image` at your image and set `app_port` to the port it listens on:
+Deploy a different image:
 
 ```bash
 terraform apply \
   -var 'app_image=123456789012.dkr.ecr.us-west-2.amazonaws.com/myapp:1.0' \
-  -var 'app_count=2'
+  -var 'app_port=8080' \
+  -var 'listener_port=8080'
 ```
 
-The image has to be reachable from Fargate. For a private ECR repository, add
-the `AmazonEC2ContainerRegistryReadOnly` policy to the task execution role.
-The container name in the task definition is hard-coded to `myapp`; if you
-change it in the template, change `container_name` in `ecs.tf` to match.
+The target group follows `app_port`, and the listener follows `listener_port`,
+so they can differ. If they do, keep the security groups in mind: the load
+balancer opens `listener_port` and 443, and the tasks open `app_port` to the
+load balancer only.
 
-If the container listens on a port other than 80, you have to change
-`aws_alb_target_group.app.port` in `alb.tf` as well as `app_port`. The target
-group port is hard-coded to 80, so the listener would otherwise forward to a
-port nothing is listening on and every health check would fail.
+Add HTTPS:
+
+```bash
+terraform apply \
+  -var 'certificate_arn=arn:aws:acm:us-west-2:123456789012:certificate/abc-123'
+```
+
+Traffic on port 80 then returns a 301 to HTTPS.
+
+Read a secret from Secrets Manager:
+
+```hcl
+secrets = {
+  DB_PASSWORD = "arn:aws:secretsmanager:us-west-2:123456789012:secret:db-pass"
+}
+```
+
+The variable name becomes the environment variable name inside the container.
+
+Shell into a running task:
+
+```bash
+terraform apply -var 'enable_exec=true'
+aws ecs execute-command \
+  --cluster myapp-cluster \
+  --task "$(aws ecs list-tasks --cluster myapp-cluster --query 'taskArns[0]' --output text)" \
+  --container myapp \
+  --interactive \
+  --command /bin/sh
+```
+
+The image needs a shell for this to be useful.
+
+Lock the load balancer down to an office range:
+
+```hcl
+ingress_cidr_blocks = ["203.0.113.0/24"]
+```
 
 ## Variables
 
 | Name | Description | Default |
 |------|-------------|---------|
-| `AWS_ACCESS_KEY` | AWS access key | none, required |
-| `AWS_SECRET_KEY` | AWS secret key | none, required |
-| `aws_region` | Region to create everything in | `us-west-2` |
-| `aws_vpc_cidr` | CIDR block for the VPC | `172.17.0.0/16` |
-| `az_count` | Number of AZs to spread across | `2` |
-| `app_image` | Docker image to run | `nginx:latest` |
-| `app_port` | Port the container listens on, and the ALB listener port | `80` |
-| `app_count` | Number of tasks the service runs | `3` |
-| `health_check_path` | Path the target group health check requests | `/` |
-| `fargate_cpu` | CPU units per task (1024 = 1 vCPU) | `256` |
-| `fargate_memory` | Memory per task, in MiB | `512` |
-| `ecs_task_execution_role_name` | Name of the task execution role | `myEcsTaskExecutionRole` |
+| `aws_region` | Region everything is created in | `us-west-2` |
+| `name_prefix` | Prefix for resource names | `myapp` |
+| `tags` | Tags applied to every resource | `{}` |
+| `aws_vpc_cidr` | VPC CIDR block | `172.17.0.0/16` |
+| `az_count` | AZs to spread across, minimum 2 | `2` |
+| `app_image` | Container image | `nginx:latest` |
+| `app_port` | Port the container listens on | `80` |
+| `app_count` | Desired task count | `3` |
+| `container_command` | Override the image CMD | `[]` |
+| `environment_variables` | Plain environment variables | `{}` |
+| `secrets` | name to ARN map, read by the execution role | `{}` |
+| `readonly_root_filesystem` | Mount the root filesystem read-only | `true` |
+| `health_check_path` | Target group health check path | `/` |
+| `fargate_cpu` | CPU units per task | `256` |
+| `fargate_memory` | Memory per task in MiB | `512` |
+| `assign_public_ip` | Give tasks public IPs | `false` |
+| `listener_port` | HTTP listener port | `80` |
+| `certificate_arn` | ACM certificate, enables HTTPS | `null` |
+| `ingress_cidr_blocks` | Who may reach the load balancer | `["0.0.0.0/0"]` |
+| `health_check_grace_period` | Seconds before health checks count | `60` |
+| `enable_container_insights` | CloudWatch Container Insights | `true` |
+| `enable_exec` | ECS Exec shell access | `false` |
+| `enable_autoscaling` | CPU target tracking | `true` |
+| `autoscaling_min_capacity` | Minimum tasks | `1` |
+| `autoscaling_max_capacity` | Maximum tasks | `10` |
+| `autoscaling_cpu_target` | Target average CPU percentage | `70` |
+| `enable_deployment_circuit_breaker` | Roll back failed deployments | `true` |
+| `create_iam_roles` | Create roles, or use the ARNs below | `true` |
+| `task_execution_role_name` | Name for the created execution role | `null` |
+| `task_execution_role_arn` | Existing execution role | `null` |
+| `task_role_arn` | Existing task role | `null` |
+| `log_retention_in_days` | Container log retention | `30` |
 
 ## Outputs
 
 | Name | Description |
 |------|-------------|
-| `alb_hostname` | DNS name of the load balancer |
+| `alb_hostname` | Public DNS name of the load balancer |
+| `alb_zone_id` | Zone id for Route 53 alias records |
+| `url` | URL the application is reachable at |
+| `cluster_name` | ECS cluster name |
+| `service_name` | ECS service name |
+| `task_definition_arn` | ARN of the active task definition |
+| `target_group_arn` | ARN of the target group |
+| `log_group_name` | CloudWatch log group |
+| `vpc_id` | VPC id |
+| `private_subnet_ids` | Subnets the tasks run in |
+| `public_subnet_ids` | Subnets the load balancer uses |
+| `task_execution_role_arn` | Effective execution role ARN |
+| `task_role_arn` | Effective task role ARN |
+| `autoscaling_enabled` | Whether autoscaling is attached |
+
+## Testing
+
+`tests/` holds Terraform test files that mock the AWS provider, so they need no
+credentials and create nothing.
+
+```bash
+terraform init
+terraform test
+```
+
+Seventeen runs: eleven covering the configuration (defaults, target group port,
+HTTPS, container definition, secrets, Exec, autoscaling, Insights, existing
+roles) and six guardrails checking that invalid input is rejected.
+
+CI runs `terraform fmt -check`, `terraform validate` and `terraform test` on
+every push and pull request.
 
 ## Layout
 
 | File | Contents |
 |------|----------|
-| `provider.tf` | AWS provider and credentials |
-| `variables.tf` | All inputs |
+| `versions.tf` | Terraform and provider constraints |
+| `provider.tf` | AWS provider, credentials from the environment, default tags |
+| `variables.tf` | All inputs, with validation |
 | `network.tf` | VPC, subnets, gateways, route tables |
 | `security.tf` | Security groups and network ACLs |
-| `alb.tf` | Load balancer, target group, listener |
-| `ecs.tf` | Cluster, task definition, service |
-| `roles.tf` | Task execution role and policy attachment |
-| `logs.tf` | CloudWatch log group and stream |
-| `outputs.tf` | ALB hostname |
-| `templates/ecs/myapp.json.tpl` | Container definition template |
+| `alb.tf` | Load balancer, target group, HTTP and HTTPS listeners |
+| `ecs.tf` | Cluster, container definition, task definition, service |
+| `autoscaling.tf` | Application Auto Scaling target and CPU policy |
+| `roles.tf` | Execution and task roles, secrets and Exec policies |
+| `logs.tf` | CloudWatch log group |
+| `outputs.tf` | URLs, names, ARNs, network ids |
+| `tests/` | Terraform test files |
 
-## Known limitations
+## Notes
 
-This is a demo stack, not something to point at production traffic as-is.
-
-- Credentials are passed as Terraform variables and written into the provider
-  block. Prefer the ambient chain (environment variables, shared config, SSO or
-  an instance role) and drop `access_key`/`secret_key` from `provider.tf`.
-  The variables are not marked `sensitive`, so their values appear in plan
-  output.
-- There is no `terraform` block pinning a provider version. Recent AWS
-  provider releases have removed or renamed several things this code uses:
-  - `aws_eip.gw` sets `vpc = true`, which is deprecated in provider 5.x and
-    removed in 6.x.
-  - `aws_alb` and `aws_alb_target_group` are deprecated aliases for `aws_lb`
-    and `aws_lb_target_group`.
-- The ALB security group accepts traffic from `0.0.0.0/0` on `app_port`. Fine
-  for a demo, but narrow it for anything real.
-- `aws_alb_target_group.app` hard-codes `port = 80`, while the listener and
-  container definition use `app_port`. Changing `app_port` alone moves the
-  listener but leaves the target group pointing at port 80.
-- The service sets `assign_public_ip = true` while running in private subnets
-  that already have NAT gateways, so tasks get public IPs they do not need.
-  Set it to `false` for the usual private-subnet pattern.
-- Two NAT gateways are created by default. They are the main recurring cost in
-  this stack.
-- No HTTPS listener or certificate. Traffic to the ALB is plain HTTP.
-- No remote state backend, so state lives in the working directory unless you
-  add one.
+- The container definition is built with `jsonencode` rather than a template
+  file, so conditional keys like `secrets` and `command` are type-checked
+  instead of string-interpolated.
+- No remote backend is configured. State lives in the working directory unless
+  you add one. Two people applying this at once will conflict.
+- `fargate_cpu` and `fargate_memory` are passed through as strings because that
+  is what the provider expects. Valid pairs are fixed by AWS, for example
+  256/512, 512/1024, 1024/2048. An invalid pair is rejected at apply, not at
+  plan.
+- Task definitions are immutable, so changing the image creates a new revision
+  and the service rolls to it. The circuit breaker rolls back if the new
+  revision never becomes healthy.

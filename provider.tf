@@ -1,9 +1,9 @@
-
-# provider.tf
-
-# Specify the provider and access details
+# Credentials come from the standard provider chain, so nothing secret lives in
+# this file: environment variables, ~/.aws/config, SSO, or an instance role.
 provider "aws" {
-  access_key              = var.AWS_ACCESS_KEY
-  secret_key              = var.AWS_SECRET_KEY
-  region                  = var.aws_region
+  region = var.aws_region
+
+  default_tags {
+    tags = var.tags
+  }
 }
